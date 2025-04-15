@@ -88,3 +88,249 @@ http://{server-url}:8081/swagger-ui.html
 - 관심사 설정
 - 자기소개 관리
 
+
+## 🔐 로그인 플로우
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 사용자
+    participant F as 프론트엔드
+    participant B as 백엔드 서버
+    participant DB as 데이터베이스/Redis
+    participant K as 카카오 API
+
+    alt 일반 로그인 (이메일/비밀번호)
+        U->>F: 로그인 페이지 접속
+        F->>U: 로그인 폼 제공
+        U->>F: 이메일/비밀번호 입력
+        F->>B: POST /api/v1/auth/sign-in
+        B->>DB: 사용자 인증 요청
+        DB->>B: 사용자 정보 반환
+        B->>B: 비밀번호 검증(PasswordEncryptor)
+        B->>B: JWT 토큰 생성(JwtTokenProvider)
+        B->>DB: Refresh 토큰 저장(RedisService)
+        B->>F: 응답: {accessToken, refreshToken, 사용자정보}
+        F->>F: 토큰 저장(sessionStorage)
+        F->>U: 로그인 성공 & 메인 페이지 리다이렉션
+    else 카카오 소셜 로그인
+        U->>F: 카카오 로그인 버튼 클릭
+        F->>B: GET /api/v1/auth (로그인 페이지 요청)
+        B->>U: 카카오 로그인 페이지로 리다이렉트
+        U->>K: 카카오 로그인 정보 입력
+        K->>U: 인증 승인 및 콜백 URL로 리다이렉트 (인증코드 포함)
+        U->>F: 콜백 URL 접근 (code 파라미터 포함)
+        F->>B: POST /api/v1/auth/kakao (code 전달)
+        B->>K: 인증 코드로 액세스 토큰 요청
+        K->>B: 카카오 액세스 토큰 발급
+        B->>K: 사용자 정보 요청(KakaoApiClient)
+        K->>B: 사용자 정보 반환
+        B->>DB: 사용자 정보 조회/저장(OAuthLoginService)
+        B->>B: JWT 토큰 생성(authTokensGenerator)
+        B->>DB: Refresh 토큰 저장(RedisService)
+        B->>F: 응답: {accessToken, refreshToken, 사용자정보}
+        F->>F: 토큰 저장(sessionStorage)
+        F->>U: 로그인 성공 & 메인/프로필 설정 페이지로 리다이렉트
+    end
+
+    Note right of F: 이후 API 요청 시 토큰 사용 프로세스
+    F->>F: axios 인터셉터로 토큰 확인
+    F->>B: API 요청 with Authorization 헤더
+    B->>B: JWT 토큰 검증(JwtInterceptor)
+    alt 토큰 유효
+        B->>F: API 응답
+    else 토큰 만료
+        B->>F: 401 Unauthorized
+        F->>F: 토큰 갱신 인터셉터 실행
+        F->>B: POST /api/v1/auth/refresh (refreshToken 전송)
+        B->>DB: Refresh 토큰 검증
+        alt Refresh 토큰 유효
+            B->>F: 새 Access Token 발급
+            F->>F: 토큰 저장 및 원래 요청 재시도
+            F->>B: 원래 API 요청(새 토큰)
+            B->>F: API 응답
+        else Refresh 토큰 만료
+            B->>F: 401 Unauthorized
+            F->>F: 로컬 스토리지 토큰 삭제
+            F->>U: 로그인 페이지로 리다이렉트
+        end
+    end
+```
+
+
+## 유저(프로필) 매칭 플로우
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant FE as Frontend
+    participant Auth as AuthService
+    participant Profile as ProfileService
+    participant Location as LocationService
+    participant Matching as MatchingService
+    participant Chat as ChatService
+    participant S3 as S3Storage
+    
+    %% 로그인 후 프로필 설정 시작
+    User->>FE: 로그인
+    FE->>Auth: 인증 요청
+    Auth-->>FE: JWT 토큰 발급 및 프로필 상태 반환
+    
+    %% 프로필 정보 입력
+    alt 프로필 미생성
+        FE->>FE: 프로필 설정 페이지로 리다이렉트
+        User->>FE: 기본 정보 입력 (성별, 생년월일, 닉네임, 자기소개)
+        FE->>Profile: createProfile API 요청
+        Profile-->>FE: 프로필 생성 결과 반환
+        
+        %% 프로필 이미지 업로드
+        User->>FE: 프로필 이미지 업로드
+        FE->>S3: 이미지 파일 업로드
+        S3-->>FE: 이미지 URL 반환
+        FE->>Profile: uploadProfileImage API 요청
+        Profile-->>FE: 이미지 저장 결과 반환
+        
+        %% 위치 정보 설정
+        User->>FE: 주소 검색 및 선택
+        FE->>FE: 주소를 위도/경도로 변환
+        FE->>Location: saveLocation API 요청
+        Location-->>FE: 위치 저장 결과 반환
+    end
+    
+    %% 매칭 시스템 진입
+    FE->>FE: 매칭 페이지로 이동
+    
+    %% 주변 사용자 검색
+    FE->>Matching: findProfiles API 요청
+    Matching->>Location: 사용자 위치 기반 검색
+    Location-->>Matching: 반경 내 프로필 목록 반환
+    Matching->>Profile: 프로필 정보 및 이미지 조회
+    Profile-->>Matching: 프로필 상세 정보 반환
+    Matching-->>FE: 주변 사용자 프로필 목록 반환
+    
+    %% 사용자 스와이프 액션
+    User->>FE: 프로필 좋아요/싫어요 선택
+    
+    alt 좋아요 선택
+        FE->>Matching: like API 호출
+        Matching->>Matching: 양방향 좋아요 확인
+        
+        alt 상대방도 좋아요한 경우 (매칭 성공)
+            Matching->>Chat: 채팅방 생성
+            Chat-->>Matching: 채팅방 ID 반환
+            Matching-->>FE: 매칭 결과 및 채팅방 정보 반환
+            FE-->>User: 매칭 성공 알림
+        else 매칭 안됨
+            Matching-->>FE: 좋아요 저장 결과 반환
+        end
+    else 싫어요 선택
+        FE->>Matching: dislike API 호출
+        Matching-->>FE: 싫어요 저장 결과 반환
+    end
+    
+    %% 다음 프로필로 이동
+    FE->>FE: 다음 사용자 프로필 표시
+    FE-->>User: 새로운 프로필 표시
+```
+
+## 채팅 플로우
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User1 as User 1
+    participant User2 as User 2
+    participant FE as Frontend
+    participant BE as Backend
+    participant WebSocket as WebSocket
+    participant RabbitMQ as RabbitMQ
+    participant Mongo as MongoDB
+    participant Redis as Redis
+
+    %% Matching and Chat Room Creation
+    User1->>FE: Swipe right (Like)
+    FE->>BE: POST /api/v1/swipes/like
+    BE->>BE: Check if mutual match
+    
+    alt Mutual match found
+        BE->>BE: Create chat room (ChatRoomService)
+        BE->>RabbitMQ: Create exchange/queue bindings
+        BE->>MongoDB: Save initial system message
+        BE->>FE: Return match result with chatRoomId
+        FE->>User1: Show match notification
+        FE->>User2: Show match notification
+    end
+
+    %% Entering Chat Room
+    User1->>FE: Open chat room
+    FE->>WebSocket: Connect to WebSocket
+    WebSocket->>BE: Establish STOMP connection
+    BE->>BE: JWT Authentication (JwtAuthenticationInterceptor)
+    BE->>Redis: Store online status
+    
+    FE->>WebSocket: Send STOMP frame to /pub/chat.enter
+    WebSocket->>BE: Process chat room entry
+    BE->>Redis: Update last entry time
+    BE->>RabbitMQ: Subscribe to chat room topic
+    BE->>FE: Send room entry confirmation
+
+    %% Sending and Receiving Messages
+    User1->>FE: Type and send message
+    FE->>WebSocket: Send to /pub/chat.message
+    WebSocket->>BE: Process message (ChatMessageService)
+    BE->>MongoDB: Save message to ChatMessage collection
+    BE->>RabbitMQ: Publish to exchange with routing key
+    
+    RabbitMQ->>WebSocket: Route message to subscribers
+    WebSocket->>FE: Deliver message to connected clients
+    FE->>User1: Display own message
+    FE->>User2: Display received message
+    
+    %% File/Image Upload
+    alt File Upload
+        User1->>FE: Select file/image
+        FE->>FE: Convert to base64
+        FE->>WebSocket: Send to /pub/chat.message with FILE type
+        WebSocket->>BE: Process file message
+        BE->>BE: Extract file data
+        BE->>S3: Upload file to S3
+        BE->>MongoDB: Save message with file URL
+        BE->>RabbitMQ: Publish file message
+        RabbitMQ->>WebSocket: Route file message
+        WebSocket->>FE: Deliver file message
+        FE->>User1: Display sent file
+        FE->>User2: Display received file
+    end
+
+    %% Message Loading and History
+    User1->>FE: Scroll up in chat
+    FE->>BE: GET /api/v1/chat-messages/chat-rooms/{id}?page=X
+    BE->>MongoDB: Query paginated messages
+    BE->>FE: Return message history
+    FE->>User1: Display older messages
+
+    %% Message Deletion
+    User1->>FE: Delete message
+    FE->>WebSocket: Send to /pub/chat.delete
+    WebSocket->>BE: Process deletion request
+    BE->>MongoDB: Update message type to DELETED
+    BE->>RabbitMQ: Publish deletion event
+    RabbitMQ->>WebSocket: Route deletion event
+    WebSocket->>FE: Notify of deletion
+    FE->>User1: Update UI to show "deleted message"
+    FE->>User2: Update UI to show "deleted message"
+
+    %% Leaving Chat Room
+    User1->>FE: Click "Leave chat room"
+    FE->>BE: DELETE /api/v1/chat-rooms/{id}/leave
+    BE->>BE: Process leave request (ChatRoomServiceImpl)
+    BE->>MongoDB: Add system message about leaving
+    BE->>Redis: Clear chat room data
+    BE->>MongoDB: Delete chat room participants
+    BE->>RabbitMQ: Publish leave message
+    RabbitMQ->>WebSocket: Route leave notification
+    WebSocket->>FE: Notify remaining user
+    FE->>User2: Show "User has left" message
+    BE->>FE: Confirm leave success
+    FE->>User1: Redirect to messages list
+```
